@@ -10,12 +10,15 @@ what makefun-site 1.0.0 returns for one generated site `{ site, templates, files
 every page's `index.html`, the index and tag pages, `build-report.txt` and each
 static file, as a JSON object of path to file text, byte for byte.
 
-The speed comes from work per byte, on one core: a single-pass HTML escaper, a
-character-dispatch fused Markdown lexer/renderer (no token array, no regex per
-line), a memoized slugify with an ASCII fast path, a regex-free word counter,
-array-join template rendering with page-invariant fragments rendered once and
-reused, and character-check front-matter and link fast paths. Nothing is cached
-from one case to the next; every per-case cache lives inside `run()`.
+The speed comes from work per byte, on one core: a single-pass HTML escaper
+(regex test fast path, then one regex replace with a lookup — measured faster
+than chained replaceAll on this corpus), a character-dispatch fused Markdown
+lexer/renderer (no token array, no regex per line) with the word count fused
+into the same single pass, a memoized slugify with an ASCII fast path,
+templates compiled once per run into plain JS functions (new Function, no
+dependency) with page-invariant fragments rendered once and reused, and
+character-check front-matter and link fast paths. Nothing is cached from one
+case to the next; every per-case cache lives inside `run()`.
 
 Verified byte-identical on all 3 practice cases, and about 3–4.5x faster than
 the makefun-site baseline locally (median CPU per case, interleaved).

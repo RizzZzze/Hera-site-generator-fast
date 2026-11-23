@@ -81,24 +81,6 @@ function isWsCode(c) {
   return c === 0xA0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
 }
 
-/** Words of the body lines [a, b): runs of non-whitespace, counted with a char scan (no regex, no call per char). */
-function countWords(lines, a, b) {
-  let total = 0;
-  for (let i = a; i < b; i++) {
-    const s = lines[i];
-    let inWord = false;
-    for (let j = 0; j < s.length; j++) {
-      const c = s.charCodeAt(j);
-      let ws;
-      if (c < 128) ws = c === 32 || (c >= 9 && c <= 13);
-      else ws = c === 0xA0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
-      if (ws) inWord = false;
-      else if (!inWord) { total++; inWord = true; }
-    }
-  }
-  return total;
-}
-
 // ---------------------------------------------------------------- front matter
 
 const KEYS = new Set(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
@@ -469,12 +451,26 @@ function inlineInto(s, lo, hi, env, out, depth) {
   if (hi > plain) out.push(s.slice(plain, hi));
 }
 
-/** Fused lex + render over lines [start, end). */
+/**
+ * Fused lex + render over lines [start, end), with the word count fused into
+ * the same single pass: every body line is counted exactly once, at the point
+ * its block consumes it (block-start line at the top, fence body + close line
+ * in the fence branch, quote/list/paragraph lines inside their loops). A
+ * separate countWords pass would re-read the same lines from cold cache.
+ */
 function renderMarkdownLines(lines, start, end, env, cx) {
   const ids = new Set();
   const blocks = [];
   const toc = [];
   let excerpt = null;
+  let words = 0;
+  const addWords = (s) => {
+    let inWord = false;
+    for (let j = 0; j < s.length; j++) {
+      if (isWsCode(s.charCodeAt(j))) inWord = false;
+      else if (!inWord) { words++; inWord = true; }
+    }
+  };
   let i = start;
   while (i < end) {
     const line = lines[i];
@@ -483,11 +479,13 @@ function renderMarkdownLines(lines, start, end, env, cx) {
     if (c0 === 96) {
       const lang = fenceOpen(line);
       if (lang !== null) {
+        addWords(line);
         let j = i + 1;
         while (j < end && !isFenceClose(lines[j])) j++;
         const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
         let s = `<pre><code${cls}>`;
-        for (let k = i + 1; k < j; k++) s += escapeHtml(lines[k]) + '\n';
+        for (let k = i + 1; k < j; k++) { addWords(lines[k]); s += escapeHtml(lines[k]) + '\n'; }
+        if (j < end) addWords(lines[j]);
         s += '</code></pre>';
         blocks.push(s);
         i = j + 1;
@@ -497,6 +495,7 @@ function renderMarkdownLines(lines, start, end, env, cx) {
     if (c0 === 35) {
       const h = headingOf(line);
       if (h !== null) {
+        addWords(line);
         const id = uniqueSlug(slugify(cx, h.text), ids);
         const html = inlineStr(h.text, env);
         blocks.push(`<h${h.depth} id="${id}">${html}</h${h.depth}>`);
@@ -505,11 +504,12 @@ function renderMarkdownLines(lines, start, end, env, cx) {
         continue;
       }
     }
-    if (isHr(line)) { blocks.push('<hr>'); i++; continue; }
+    if (isHr(line)) { addWords(line); blocks.push('<hr>'); i++; continue; }
     if (c0 === 62) {
       const body = [];
       while (i < end && lines[i].charCodeAt(0) === 62) {
         const l = lines[i++];
+        addWords(l);
         body.push(l.length > 1 && l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
       }
       const qb = [];
@@ -529,9 +529,11 @@ function renderMarkdownLines(lines, start, end, env, cx) {
         const li = lines[i];
         const m = isOrdered ? orderedItem(li) : bulletText(li);
         if (m !== null) {
+          addWords(li);
           items.push([trimLine(isOrdered ? m.text : m)]);
           i++;
         } else if (isContinued(li)) {
+          addWords(li);
           items[items.length - 1].push(trimLine(li));
           i++;
         } else break;
@@ -544,14 +546,15 @@ function renderMarkdownLines(lines, start, end, env, cx) {
       blocks.push(s);
       continue;
     }
+    addWords(line);
     const body = [trimLine(line)];
     i++;
-    while (i < end && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < end && !endsParagraph(lines[i])) { addWords(lines[i]); body.push(trimLine(lines[i++])); }
     const html = inlineStr(body.join('\n'), env);
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt ?? '', words };
 }
 
 // ---------------------------------------------------------------- templates
@@ -736,67 +739,76 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderInto(nodes, scope, ctx, depth, out, shadowed) {
-  for (let ni = 0; ni < nodes.length; ni++) {
-    const n = nodes[ni];
-    switch (n.kind) {
-      case 'text':
-        out.push(n.text);
-        break;
-      case 'var':
-        out.push(escapeHtml(textOf(lookup(scope, n.path))));
-        break;
-      case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
-        break;
-      case 'if': {
-        const v = truthy(lookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderInto(branch, scope, ctx, depth, out, shadowed);
-        break;
-      }
-      case 'for': {
-        const xs = lookup(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        const sh = shadowed || n.name === 'site' || n.name === 'tags' || n.name === 'recent';
-        // One vars/scope pair per execution, mutated per iteration: rendering is
-        // synchronous and depth-first, so no iteration can observe another's
-        // values, and a re-entrant execution of this node makes its own pair.
-        // `loop` is set after the element, so a loop var named "loop" still
-        // resolves to the loop record, as the baseline's literal does.
-        const vars = {};
-        const loop = { index: 0, first: false, last: false, length: xs.length };
-        vars.loop = loop;
-        const child = { vars, parent: scope };
-        for (let k = 0; k < xs.length; k++) {
-          vars[n.name] = xs[k];
-          vars.loop = loop;
-          loop.index = k + 1;
-          loop.first = k === 0;
-          loop.last = k === xs.length - 1;
-          renderInto(n.body, child, ctx, depth, out, sh);
-        }
-        break;
-      }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t === undefined || depth >= 8) break;
-        if (ctx.invariant.has(n.name) && !shadowed) {
-          const key = n.name + '\n' + (depth + 1);
-          let cached = ctx.invCache.get(key);
-          if (cached === undefined) {
-            const tmp = [];
-            renderInto(t, ctx.globalScope, ctx, depth + 1, tmp, false);
-            cached = tmp.join('');
-            ctx.invCache.set(key, cached);
-          }
-          out.push(cached);
-        } else {
-          renderInto(t, scope, ctx, depth + 1, out, shadowed);
-        }
-        break;
-      }
+/**
+ * Templates, compiled to functions (the doT.js / Eta shape): each template is
+ * compiled ONCE per run into a plain JS function (new Function, no dependency)
+ * and then just called per page. No tree walk at render time, no per-node
+ * switch: text becomes a literal push, var/raw/if/for become straight JS, and
+ * includes go through renderInclude below. The generated function takes
+ * (scope, ctx, depth, out, shadowed); helpers live on ctx because a
+ * new-Function function cannot see this module's lexical scope. Semantics are
+ * the interpreter's, statement for statement: lookup's scope chain, textOf,
+ * truthy, the depth cap, and the invariant cache are unchanged.
+ */
+function genNodes(nodes, scopeVar, shadowVar, gen) {
+  let code = '';
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n.kind === 'text') {
+      code += 'out.push(' + JSON.stringify(n.text) + ');';
+    } else if (n.kind === 'var') {
+      code += 'out.push(ctx.escapeHtml(ctx.textOf(ctx.lookup(' + scopeVar + ',' + JSON.stringify(n.path) + '))));';
+    } else if (n.kind === 'raw') {
+      code += 'out.push(ctx.textOf(ctx.lookup(' + scopeVar + ',' + JSON.stringify(n.path) + ')));';
+    } else if (n.kind === 'if') {
+      const cond = 'ctx.truthy(ctx.lookup(' + scopeVar + ',' + JSON.stringify(n.path) + '))';
+      code += 'if(' + (n.not ? '!(' + cond + ')' : cond) + '){' + genNodes(n.then, scopeVar, shadowVar, gen) + '}';
+      if (n.else !== null) code += 'else{' + genNodes(n.else, scopeVar, shadowVar, gen) + '}';
+    } else if (n.kind === 'for') {
+      const id = gen.n++;
+      const shVar = 'sh' + id;
+      // One vars/scope pair per execution, mutated per iteration: rendering is
+      // synchronous and depth-first, so no iteration can observe another's
+      // values, and a re-entrant execution of this node makes its own pair.
+      // `loop` is set after the element, so a loop var named "loop" still
+      // resolves to the loop record, as the baseline's literal does.
+      code += '{const xs' + id + '=ctx.lookup(' + scopeVar + ',' + JSON.stringify(n.path) + ');'
+        + 'if(Array.isArray(xs' + id + ')){'
+        + 'const ' + shVar + '=' + shadowVar + '||' + JSON.stringify(n.name) + '==="site"||' + JSON.stringify(n.name) + '==="tags"||' + JSON.stringify(n.name) + '==="recent";'
+        + 'const vars' + id + '={};const loop' + id + '={index:0,first:false,last:false,length:xs' + id + '.length};'
+        + 'vars' + id + '.loop=loop' + id + ';const child' + id + '={vars:vars' + id + ',parent:' + scopeVar + '};'
+        + 'for(let k' + id + '=0;k' + id + '<xs' + id + '.length;k' + id + '++){'
+        + 'vars' + id + '[' + JSON.stringify(n.name) + ']=xs' + id + '[k' + id + '];'
+        + 'vars' + id + '.loop=loop' + id + ';'
+        + 'loop' + id + '.index=k' + id + '+1;loop' + id + '.first=k' + id + '===0;loop' + id + '.last=k' + id + '===xs' + id + '.length-1;'
+        + genNodes(n.body, 'child' + id, shVar, gen)
+        + '}}}';
+    } else if (n.kind === 'include') {
+      code += 'ctx.renderInclude(ctx,' + JSON.stringify(n.name) + ',' + scopeVar + ',depth,out,' + shadowVar + ');';
     }
+  }
+  return code;
+}
+
+function compileTemplate(nodes) {
+  return new Function('scope', 'ctx', 'depth', 'out', 'shadowed', genNodes(nodes, 'scope', 'shadowed', { n: 0 }));
+}
+
+function renderInclude(ctx, name, scope, depth, out, shadowed) {
+  const fn = ctx.compiled.get(name);
+  if (fn === undefined || depth >= 8) return;
+  if (ctx.invariant.has(name) && !shadowed) {
+    const key = name + '\n' + (depth + 1);
+    let cached = ctx.invCache.get(key);
+    if (cached === undefined) {
+      const tmp = [];
+      fn(ctx.globalScope, ctx, depth + 1, tmp, false);
+      cached = tmp.join('');
+      ctx.invCache.set(key, cached);
+    }
+    out.push(cached);
+  } else {
+    fn(scope, ctx, depth + 1, out, shadowed);
   }
 }
 
@@ -842,6 +854,8 @@ export function run(input) {
     }
   }
   const invariant = computeInvariant(templates);
+  const compiled = new Map();
+  for (const [name, nodes] of templates) compiled.set(name, compileTemplate(nodes));
   const base = input.site.base_url.replace(/\/+$/, '');
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   const sources = [];
@@ -933,7 +947,7 @@ export function run(input) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.reading = Math.max(1, Math.ceil(countWords(s.lines, s.bodyStart, s.lines.length) / 200));
+    s.reading = Math.max(1, Math.ceil(md.words / 200));
   }
   const posts = kept.filter((s) => s.post);
   posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
@@ -1005,13 +1019,13 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const tctx = { templates, invariant, invCache: new Map(), globalScope: { vars: { site, tags: allTags, recent }, parent: null } };
+  const tctx = { compiled, invariant, invCache: new Map(), globalScope: { vars: { site, tags: allTags, recent }, parent: null }, escapeHtml, textOf, truthy, lookup, renderInclude };
   const output = {};
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
+    const fn = compiled.get(name);
+    if (fn === undefined) return null;
     const out = [];
-    renderInto(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, tctx, 0, out, false);
+    fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, tctx, 0, out, false);
     return out.join('');
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
